@@ -153,14 +153,11 @@ def translate_page(page: fitz.Page, page_num: int):
         if len(full_text.replace(" ", "")) <= 3:
             continue
 
-        # Skip: equation blocks (math fonts with few real text chars)
-        if _block_has_math_font(block) and _block_alpha_count(block) < 15:
+        # Skip: equation blocks (math fonts) — both pure equations and mixed
+        # text+equation blocks. Inline math is interleaved with text on the
+        # same lines, so placing Hebrew over them causes visual overlap.
+        if _block_has_math_font(block):
             continue
-
-        # Collect per-line data
-        # For MIXED blocks (math fonts + body text), skip math-font spans
-        # so equations stay untouched in their original fonts and positions.
-        is_mixed = _block_has_math_font(block) and _block_alpha_count(block) >= 15
         line_entries = []
         all_spans = []
         for line in block["lines"]:
@@ -168,9 +165,6 @@ def translate_page(page: fitz.Page, page_num: int):
             spans = []
             for span in line["spans"]:
                 if not span["text"].strip():
-                    continue
-                # In mixed blocks, skip math-font spans (preserve equations)
-                if is_mixed and any(mf in span["font"] for mf in MATH_FONTS):
                     continue
                 lt += span["text"]
                 spans.append(span)
@@ -451,8 +445,14 @@ def main():
         out_doc.save(output_path, garbage=4, deflate=True)
     except Exception:
         base_out, ext_out = os.path.splitext(output_path)
-        output_path = f"{base_out}_new{ext_out}"
-        out_doc.save(output_path, garbage=4, deflate=True)
+        # Try _new, then timestamp fallback
+        for suffix in ["_new", f"_{int(__import__('time').time())}"]:
+            try:
+                output_path = f"{base_out}{suffix}{ext_out}"
+                out_doc.save(output_path, garbage=4, deflate=True)
+                break
+            except Exception:
+                continue
     out_doc.close()
 
     print(f"\nDone! Translated PDF saved to: {output_path}")
