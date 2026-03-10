@@ -10,9 +10,13 @@ import json
 import requests
 import fitz  # PyMuPDF
 from bidi.algorithm import get_display
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 sys.stdout.reconfigure(encoding="utf-8")
 
+
+_print_lock = threading.Lock()
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "translategemma:12b"
@@ -117,9 +121,15 @@ def wrap_hebrew_text(text, font, fontsize, max_width):
     return lines
 
 
+def _tprint(*args, **kwargs):
+    """Thread-safe print."""
+    with _print_lock:
+        print(*args, **kwargs)
+
+
 def translate_page(page: fitz.Page, page_num: int):
     """Translate text on a page from English to Hebrew, preserving equations and layout."""
-    print(f"Processing page {page_num}...")
+    _tprint(f"Processing page {page_num}...")
 
     text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
     blocks = text_dict.get("blocks", [])
@@ -204,7 +214,7 @@ def translate_page(page: fitz.Page, page_num: int):
         })
 
     if not units:
-        print(f"  No translatable text on page {page_num}.")
+        _tprint(f"  No translatable text on page {page_num}.")
         return
 
     # Phase 2: Translate all units
@@ -212,7 +222,7 @@ def translate_page(page: fitz.Page, page_num: int):
     for i, unit in enumerate(units):
         ut = unit["text"]
         if ut not in translations:
-            print(f"  Translating ({i+1}/{len(units)}): "
+            _tprint(f"  [p{page_num}] Translating ({i+1}/{len(units)}): "
                   f"{ut[:60]}{'...' if len(ut)>60 else ''}")
             translations[ut] = translate_text(ut)
 
@@ -288,7 +298,25 @@ def translate_page(page: fitz.Page, page_num: int):
                           font=font, fontsize=actual_size)
                 tw.write_text(page, color=(r_c, g_c, b_c))
             except Exception as e:
-                print(f"  [Insert error: {e}]")
+                _tprint(f"  [p{page_num} Insert error: {e}]")
+
+
+def _translate_page_worker(src_pdf_path: str, orig_page_idx: int) -> bytes:
+    """Worker function: open source PDF, extract one page, translate it, return PDF bytes.
+
+    Each worker operates on its own fitz.Document — fully thread-safe.
+    """
+    page_num = orig_page_idx + 1
+    doc = fitz.open(src_pdf_path)
+    tmp_doc = fitz.open()
+    tmp_doc.insert_pdf(doc, from_page=orig_page_idx, to_page=orig_page_idx)
+    doc.close()
+
+    translate_page(tmp_doc[0], page_num)
+
+    pdf_bytes = tmp_doc.tobytes(garbage=4, deflate=True)
+    tmp_doc.close()
+    return pdf_bytes
 
 
 def parse_page_range(range_str: str, max_pages: int) -> list[int]:
@@ -310,13 +338,21 @@ def parse_page_range(range_str: str, max_pages: int) -> list[int]:
 
 
 def main():
-    # Get input from user
-    if len(sys.argv) >= 3:
-        pdf_path = sys.argv[1]
-        page_range_str = sys.argv[2]
-    else:
-        pdf_path = input("Enter PDF file name/path: ").strip()
-        page_range_str = input("Enter page range (e.g. 1-5 or 3,7,10-12): ").strip()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Translate PDF pages from English to Hebrew.",
+        usage="%(prog)s [pdf_path] [page_range] [--workers N]",
+    )
+    parser.add_argument("pdf_path", nargs="?", default=None, help="Path to source PDF")
+    parser.add_argument("page_range", nargs="?", default=None, help="Page range (e.g. 1-5 or 3,7,10-12)")
+    parser.add_argument("--workers", "-w", type=int, default=1,
+                        help="Number of parallel page workers (default: 1, max recommended: 4)")
+    args = parser.parse_args()
+
+    pdf_path = args.pdf_path or input("Enter PDF file name/path: ").strip()
+    page_range_str = args.page_range or input("Enter page range (e.g. 1-5 or 3,7,10-12): ").strip()
+    num_workers = max(1, args.workers)
 
     if not os.path.exists(pdf_path):
         # Try in current directory
@@ -326,6 +362,8 @@ def main():
         else:
             print(f"Error: File '{pdf_path}' not found.")
             sys.exit(1)
+
+    pdf_path = os.path.abspath(pdf_path)
 
     # Verify Ollama is running and model is available
     try:
@@ -338,9 +376,10 @@ def main():
         print("Error: Cannot connect to Ollama. Make sure it's running on localhost:11434")
         sys.exit(1)
 
-    # Open PDF
+    # Open PDF to get page count
     doc = fitz.open(pdf_path)
     total_pages = len(doc)
+    doc.close()
     print(f"Opened '{pdf_path}' ({total_pages} pages)")
 
     pages = parse_page_range(page_range_str, total_pages)
@@ -350,20 +389,54 @@ def main():
 
     print(f"Will translate pages: {[p+1 for p in pages]}")
 
-    # Create output doc with only selected pages
-    out_doc = fitz.open()
-    for orig_page in pages:
-        out_doc.insert_pdf(doc, from_page=orig_page, to_page=orig_page)
+    if num_workers > 1 and len(pages) > 1:
+        # ── Parallel mode ──
+        actual_workers = min(num_workers, len(pages))
+        print(f"Using {actual_workers} parallel workers")
 
-    # Translate each page
-    for i in range(len(out_doc)):
-        orig_page_num = pages[i] + 1
-        translate_page(out_doc[i], orig_page_num)
+        # Each worker opens the PDF independently and translates one page
+        results = {}  # page_idx -> pdf_bytes
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            future_to_page = {
+                executor.submit(_translate_page_worker, pdf_path, page_idx): page_idx
+                for page_idx in pages
+            }
+            for future in as_completed(future_to_page):
+                page_idx = future_to_page[future]
+                try:
+                    results[page_idx] = future.result()
+                    _tprint(f"  Page {page_idx + 1} done.")
+                except Exception as e:
+                    _tprint(f"  ERROR on page {page_idx + 1}: {e}")
+
+        # Merge results in page order
+        out_doc = fitz.open()
+        for page_idx in pages:
+            if page_idx in results:
+                tmp = fitz.open("pdf", results[page_idx])
+                out_doc.insert_pdf(tmp)
+                tmp.close()
+            else:
+                # Fallback: include original untranslated page
+                src = fitz.open(pdf_path)
+                out_doc.insert_pdf(src, from_page=page_idx, to_page=page_idx)
+                src.close()
+    else:
+        # ── Sequential mode (original behavior) ──
+        doc = fitz.open(pdf_path)
+        out_doc = fitz.open()
+        for orig_page in pages:
+            out_doc.insert_pdf(doc, from_page=orig_page, to_page=orig_page)
+        doc.close()
+
+        for i in range(len(out_doc)):
+            orig_page_num = pages[i] + 1
+            translate_page(out_doc[i], orig_page_num)
 
     # Save output
     base, ext = os.path.splitext(os.path.basename(pdf_path))
     output_path = os.path.join(
-        os.path.dirname(os.path.abspath(pdf_path)),
+        os.path.dirname(pdf_path),
         f"{base}_hebrew_p{page_range_str.replace(',','_').replace(' ','')}.pdf",
     )
 
@@ -374,7 +447,6 @@ def main():
         output_path = f"{base_out}_new{ext_out}"
         out_doc.save(output_path, garbage=4, deflate=True)
     out_doc.close()
-    doc.close()
 
     print(f"\nDone! Translated PDF saved to: {output_path}")
 
