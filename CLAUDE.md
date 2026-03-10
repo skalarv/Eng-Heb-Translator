@@ -64,8 +64,50 @@
   - All 5 images preserved
   - Caption at 9.2pt within caption column (y=570-647)
 
+### Feature: Parallel Page Translation
+- Added `--workers N` (`-w N`) CLI flag for multi-threaded page translation
+- Each worker opens its own independent PDF document — fully thread-safe, no shared state
+- Ollama queues concurrent requests from all workers
+- Results merged in page order after all workers complete
+- Falls back to original untranslated page if a worker fails
+- Thread-safe `_tprint()` with `threading.Lock` for clean interleaved console output
+- Uses `concurrent.futures.ThreadPoolExecutor` + `as_completed`
+- `--workers 1` (default) uses original sequential path with zero overhead
+- Recommended: `-w 2` to `-w 3` (Ollama serializes inference, so diminishing returns beyond 3)
+- **QA: 50/50 PASSED** (no changes to test suite needed — parallel is transparent)
+
+### Documentation Created
+- `README.md` — project overview, features, prerequisites, quick start, usage, project structure
+- `docs/FUNCTIONAL.md` — full functional spec: architecture, 4-phase pipeline, block classification, data flow, all functions with signatures, constants, error handling, test coverage, known limitations
+- `docs/MANUAL.md` — user manual: installation, setup, CLI usage, output explanation, QA guide, diagnostic tools, 9 troubleshooting scenarios, 5 configuration options, worked examples
+
+### GitHub Repository
+- **Repo**: https://github.com/skalarv/Eng-Heb-Translator
+- **Branch**: `master`
+- **Commits**: initial code → documentation → parallel translation
+
 ### Project Files
-- `translate_pdf.py` — main translation script (paragraph-level, overlap-safe)
+- `translate_pdf.py` — main translation script (paragraph-level, overlap-safe, parallel-capable)
 - `test_translate_qa.py` — 50-test QA suite (incl. overlap detection)
 - `visual_compare.py` — source vs output structural comparison
 - `deep_inspect.py`, `inspect_output.py` — debugging/inspection tools
+- `README.md` — project README
+- `docs/FUNCTIONAL.md` — functional specification
+- `docs/MANUAL.md` — user manual
+- `.gitignore` — excludes PDFs, images, __pycache__
+
+### Quick Reference
+```bash
+# Sequential (single page)
+python translate_pdf.py "textbook.pdf" "22"
+
+# Parallel (multiple pages)
+python translate_pdf.py "textbook.pdf" "20-25" --workers 3
+
+# Run QA
+python test_translate_qa.py
+
+# Dependencies
+pip install pymupdf python-bidi requests
+ollama pull translategemma:12b
+```
