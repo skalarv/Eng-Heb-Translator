@@ -199,6 +199,8 @@ test("No words lost in wrapping", all_words == wrapped_words,
 print("\n=== Test Group 7: Source PDF Page 22 Structure ===")
 
 src_pdf = "Modern_Physics_by_Tipler_6th_edition.pdf"
+if not os.path.exists(src_pdf):
+    src_pdf = "source/Modern_Physics_by_Tipler_6th_edition.pdf"
 if os.path.exists(src_pdf):
     doc = fitz.open(src_pdf)
     page = doc[21]
@@ -319,45 +321,55 @@ if os.path.exists(src_pdf) and ollama_up:
     test("No word fragment 'tory' as standalone in output",
          "\ntory " not in out_text.lower() and out_text.lower().find("tory physics") == -1)
 
-    # CRITICAL: Check no Hebrew text overlaps with equation blocks.
-    # Find y-ranges of equation blocks and Hebrew text blocks.
-    eq_y_ranges = []  # (y_top, y_bottom) for each equation block
-    heb_y_positions = []  # y_bottom for each Hebrew text span
-
-    for b in td.get("blocks", []):
+    # CRITICAL: Check no Hebrew text visually overlaps with PURE equation blocks.
+    # Use SOURCE PDF to identify true equation blocks (before redaction changed structure).
+    # After redaction, MIXED blocks' leftover math spans look like pure equations.
+    src_doc = fitz.open(src_pdf)
+    src_td = src_doc[21].get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+    eq_rects = []  # (x0, y0, x1, y1) for each pure equation block in SOURCE
+    for b in src_td.get("blocks", []):
         if b["type"] != 0:
             continue
-        block_has_math = False
-        block_has_few_alpha = True
-        for line in b["lines"]:
-            for span in line["spans"]:
-                if any(mf in span["font"] for mf in {"PearsonMATH", "MathematicalPi"}):
-                    block_has_math = True
-        if block_has_math:
-            # Get y range of this equation block
-            ys = []
+        block_has_math = any(
+            any(mf in span["font"] for mf in {"PearsonMATH", "MathematicalPi"})
+            for line in b["lines"] for span in line["spans"]
+        )
+        text_alpha = sum(
+            sum(1 for c in span["text"] if c.isalpha())
+            for line in b["lines"] for span in line["spans"]
+            if not any(mf in span["font"] for mf in {"PearsonMATH", "MathematicalPi"})
+        )
+        if block_has_math and text_alpha < 15:
+            xs, ys = [], []
             for line in b["lines"]:
                 for span in line["spans"]:
                     if span["text"].strip():
-                        ys.append(span["bbox"][1])
-                        ys.append(span["bbox"][3])
-            if ys:
-                eq_y_ranges.append((min(ys), max(ys)))
+                        xs.extend([span["bbox"][0], span["bbox"][2]])
+                        ys.extend([span["bbox"][1], span["bbox"][3]])
+            if xs and ys:
+                eq_rects.append((min(xs), min(ys), max(xs), max(ys)))
+    src_doc.close()
 
-        # Collect Hebrew text y positions
+    # Collect Hebrew text span rects from OUTPUT
+    heb_rects = []
+    for b in td.get("blocks", []):
+        if b["type"] != 0:
+            continue
         for line in b["lines"]:
             for span in line["spans"]:
                 t = span["text"].strip()
                 if t and any("\u0590" <= c <= "\u05FF" for c in t):
-                    heb_y_positions.append(span["bbox"][3])  # bottom of text
+                    heb_rects.append(tuple(span["bbox"]))
 
-    # Check: no Hebrew text bottom extends into any equation y-range
+    # Check: no Hebrew span bbox overlaps with any pure equation bbox
     overlaps = []
-    for heb_y in heb_y_positions:
-        for eq_top, eq_bot in eq_y_ranges:
-            if eq_top - 2 < heb_y < eq_bot + 2:
-                overlaps.append((heb_y, eq_top, eq_bot))
-    test("No Hebrew text overlaps with equation blocks",
+    for hx0, hy0, hx1, hy1 in heb_rects:
+        for ex0, ey0, ex1, ey1 in eq_rects:
+            x_overlap = hx0 < ex1 and hx1 > ex0
+            y_overlap = hy0 < ey1 + 2 and hy1 > ey0 - 2
+            if x_overlap and y_overlap:
+                overlaps.append((hy1, ey0, ey1))
+    test("No Hebrew text overlaps with pure equation blocks",
          len(overlaps) == 0,
          f"found {len(overlaps)} overlaps: {overlaps[:3]}")
 

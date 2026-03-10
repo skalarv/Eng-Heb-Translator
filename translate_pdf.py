@@ -54,7 +54,7 @@ def translate_text(text: str) -> str:
                     {"role": "user", "content": text},
                 ],
                 "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 512},
+                "options": {"temperature": 0.1, "num_predict": max(512, len(text) * 3)},
             },
             timeout=120,
         )
@@ -158,15 +158,22 @@ def translate_page(page: fitz.Page, page_num: int):
             continue
 
         # Collect per-line data
+        # For MIXED blocks (math fonts + body text), skip math-font spans
+        # so equations stay untouched in their original fonts and positions.
+        is_mixed = _block_has_math_font(block) and _block_alpha_count(block) >= 15
         line_entries = []
         all_spans = []
         for line in block["lines"]:
             lt = ""
             spans = []
             for span in line["spans"]:
-                if span["text"].strip():
-                    lt += span["text"]
-                    spans.append(span)
+                if not span["text"].strip():
+                    continue
+                # In mixed blocks, skip math-font spans (preserve equations)
+                if is_mixed and any(mf in span["font"] for mf in MATH_FONTS):
+                    continue
+                lt += span["text"]
+                spans.append(span)
             lt_stripped = lt.strip()
             if lt_stripped:
                 y_vals = [s["bbox"][1] for s in spans]
