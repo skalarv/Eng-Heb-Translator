@@ -1,0 +1,16 @@
+{
+  "iteration": 15,
+  "timestamp": "2026-03-11 15:44:36",
+  "translated_pdf": "source/Modern_Physics_by_Tipler_6th_edition_hebrew_p21-29.pdf",
+  "source_pdf": "source/Modern_Physics_by_Tipler_6th_edition.pdf",
+  "stats": {
+    "total_blocks": 29,
+    "hebrew_blocks": 29,
+    "english_blocks": 0,
+    "mixed_blocks": 2
+  },
+  "issues": [],
+  "vision_raw": "PASS — no major issues found.",
+  "hebrew_quality_raw": "1. CUTOFF: Hebrew sentences that end abruptly mid-word (truncated text)\n2. MISSING_TRANSLATION: Large English paragraphs that should be in Hebrew but weren't translated\n3. WRONG_DIRECTION: Hebrew text that reads left-to-right instead of right-to-left\n4. FRAGMENT: Very short Hebrew phrases (1-2 words) that seem disconnected from context\n5. FONT_TOO_SMALL: Hebrew text that is significantly smaller than surrounding text",
+  "verdict": "PASS"
+}

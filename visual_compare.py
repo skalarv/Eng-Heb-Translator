@@ -1,152 +1,223 @@
-"""Visual comparison: source page 22 vs translated output."""
-import fitz, sys
+"""
+Visual comparison: render source and translated pages side by side,
+check that layout, equations, images, and labels are preserved.
+"""
+import sys
+import os
+import fitz
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 MATH_FONTS = {"PearsonMATH", "MathematicalPi"}
 
-def describe_block(b, label):
-    if b["type"] == 1:
-        bbox = b.get("bbox", [0,0,0,0])
-        return f"  [{label}] IMAGE at [{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]"
-    lines = []
-    for line in b["lines"]:
-        for span in line["spans"]:
-            t = span["text"].strip()
-            if t:
-                is_math = any(mf in span["font"] for mf in MATH_FONTS)
-                tag = "[MATH]" if is_math else ""
-                lines.append(f"    sz={span['size']:.0f} fn={span['font'][:15]:15s} "
-                           f"[{span['bbox'][0]:.0f},{span['bbox'][1]:.0f},"
-                           f"{span['bbox'][2]:.0f},{span['bbox'][3]:.0f}] "
-                           f"{tag} '{t[:70]}'")
-    return "\n".join(lines) if lines else "    (empty)"
+
+def compare_pages(src_page, out_page, page_num):
+    """Compare source and output page structure. Returns list of issues."""
+    issues = []
+    src_td = src_page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+    out_td = out_page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+    src_blocks = src_td.get("blocks", [])
+    out_blocks = out_td.get("blocks", [])
+
+    # 1. Page dimensions must match
+    if abs(src_page.rect.width - out_page.rect.width) > 1 or \
+       abs(src_page.rect.height - out_page.rect.height) > 1:
+        issues.append(f"Page size mismatch: src={src_page.rect.width:.0f}x{src_page.rect.height:.0f} "
+                      f"out={out_page.rect.width:.0f}x{out_page.rect.height:.0f}")
+
+    # 2. Images preserved
+    src_imgs = [b for b in src_blocks if b["type"] == 1]
+    out_imgs = [b for b in out_blocks if b["type"] == 1]
+    if len(out_imgs) < len(src_imgs):
+        issues.append(f"Images lost: src={len(src_imgs)} out={len(out_imgs)}")
+
+    # 3. Equation fonts preserved (math-font spans should exist in output)
+    src_math = 0
+    out_math = 0
+    for b in src_blocks:
+        if b["type"] != 0:
+            continue
+        for line in b["lines"]:
+            for span in line["spans"]:
+                if any(mf in span["font"] for mf in MATH_FONTS) and span["text"].strip():
+                    src_math += 1
+    for b in out_blocks:
+        if b["type"] != 0:
+            continue
+        for line in b["lines"]:
+            for span in line["spans"]:
+                if any(mf in span["font"] for mf in MATH_FONTS) and span["text"].strip():
+                    out_math += 1
+    if src_math > 0 and out_math == 0:
+        issues.append(f"All equation fonts lost: src={src_math} math spans, out=0")
+    elif src_math > 0 and out_math < src_math * 0.5:
+        issues.append(f"Many equation fonts lost: src={src_math} out={out_math}")
+
+    # 4. Axis labels preserved (short labels <=3 chars near figures)
+    src_labels = set()
+    out_labels = set()
+    for b in src_blocks:
+        if b["type"] != 0:
+            continue
+        for line in b["lines"]:
+            for span in line["spans"]:
+                t = span["text"].strip()
+                if t and len(t) <= 3 and not any("\u0590" <= c <= "\u05FF" for c in t):
+                    src_labels.add(t)
+    for b in out_blocks:
+        if b["type"] != 0:
+            continue
+        for line in b["lines"]:
+            for span in line["spans"]:
+                t = span["text"].strip()
+                if t and len(t) <= 3 and not any("\u0590" <= c <= "\u05FF" for c in t):
+                    out_labels.add(t)
+    lost_labels = src_labels - out_labels
+    if lost_labels:
+        issues.append(f"Labels lost: {lost_labels}")
+
+    # 5. Output has Hebrew text
+    out_text = out_page.get_text()
+    has_hebrew = any("\u0590" <= c <= "\u05FF" for c in out_text)
+    if not has_hebrew:
+        issues.append("No Hebrew text found in output")
+
+    # 6. Check for S9 (should be S')
+    if "S9" in out_text:
+        issues.append("Found 'S9' instead of \"S'\" — prime fix not applied")
+
+    # 7. Check for model apology
+    if "\u05de\u05e6\u05d8\u05e2\u05e8" in out_text:  # מצטער
+        issues.append("Found model apology text")
+
+    # 8. Y-range coverage (text should span similar vertical range)
+    def y_range(blocks):
+        ymin, ymax = 999, 0
+        for b in blocks:
+            if b["type"] != 0:
+                continue
+            for line in b["lines"]:
+                for span in line["spans"]:
+                    if span["text"].strip():
+                        ymin = min(ymin, span["bbox"][1])
+                        ymax = max(ymax, span["bbox"][3])
+        return ymin, ymax
+
+    src_yr = y_range(src_blocks)
+    out_yr = y_range(out_blocks)
+    if abs(src_yr[0] - out_yr[0]) > 20:
+        issues.append(f"Y-start shifted: src={src_yr[0]:.0f} out={out_yr[0]:.0f}")
+    if abs(src_yr[1] - out_yr[1]) > 30:
+        issues.append(f"Y-end shifted: src={src_yr[1]:.0f} out={out_yr[1]:.0f}")
+
+    # 9. Visual overlap detection: check if any two Hebrew text blocks overlap
+    heb_rects = []
+    for b in out_blocks:
+        if b["type"] != 0:
+            continue
+        for line in b["lines"]:
+            for span in line["spans"]:
+                t = span["text"].strip()
+                if t and any("\u0590" <= c <= "\u05FF" for c in t):
+                    heb_rects.append(span["bbox"])
+    overlap_count = 0
+    for i in range(len(heb_rects)):
+        for j in range(i + 1, len(heb_rects)):
+            r1, r2 = heb_rects[i], heb_rects[j]
+            # Check vertical overlap (>3pt) AND horizontal overlap
+            v_overlap = min(r1[3], r2[3]) - max(r1[1], r2[1])
+            h_overlap = min(r1[2], r2[2]) - max(r1[0], r2[0])
+            if v_overlap > 3 and h_overlap > 5:
+                overlap_count += 1
+    if overlap_count > 0:
+        issues.append(f"Hebrew text overlap detected: {overlap_count} overlapping pairs")
+
+    # 10. Render both pages and save comparison image
+    return issues
 
 
-print("=" * 80)
-print("VISUAL COMPARISON: Source page 22 vs Translated output")
-print("=" * 80)
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Compare source and translated PDF pages.")
+    parser.add_argument("source_pdf", help="Path to source PDF")
+    parser.add_argument("output_pdf", help="Path to translated output PDF")
+    parser.add_argument("--pages", default=None,
+                        help="Source page range that was translated (e.g. '20-25')")
+    parser.add_argument("--save-images", action="store_true",
+                        help="Save side-by-side comparison images")
+    args = parser.parse_args()
 
-# Source
-src = fitz.open("Modern_Physics_by_Tipler_6th_edition.pdf")
-src_page = src[21]
-src_td = src_page.get_text("dict")
-src_blocks = src_td.get("blocks", [])
+    src_doc = fitz.open(args.source_pdf)
+    out_doc = fitz.open(args.output_pdf)
 
-# Output
-out = fitz.open("Modern_Physics_by_Tipler_6th_edition_hebrew_p22.pdf")
-out_page = out[0]
-out_td = out_page.get_text("dict")
-out_blocks = out_td.get("blocks", [])
+    # Determine page mapping
+    total_out = len(out_doc)
+    if args.pages:
+        from translate_pdf import parse_page_range
+        src_indices = parse_page_range(args.pages, len(src_doc))
+    else:
+        src_indices = list(range(total_out))
 
-print(f"\nSource: {len(src_blocks)} blocks | Output: {len(out_blocks)} blocks")
-print(f"Source page: {src_page.rect.width:.0f}x{src_page.rect.height:.0f} | "
-      f"Output page: {out_page.rect.width:.0f}x{out_page.rect.height:.0f}")
+    if len(src_indices) != total_out:
+        print(f"Warning: {len(src_indices)} source pages vs {total_out} output pages")
+        src_indices = src_indices[:total_out]
 
-# Check structural elements
-print("\n--- STRUCTURAL CHECK ---")
+    print(f"Comparing {total_out} pages...")
+    print()
 
-# 1. Page number
-print("\n[1] Page number:")
-for b in out_blocks:
-    if b["type"] != 0: continue
-    for line in b["lines"]:
-        for span in line["spans"]:
-            if span["text"].strip() == "4" and span["bbox"][0] < 60:
-                print(f"  OK: Page number '4' at [{span['bbox'][0]:.0f},{span['bbox'][1]:.0f}]")
+    total_issues = 0
+    for out_idx in range(total_out):
+        src_idx = src_indices[out_idx]
+        src_page = src_doc[src_idx]
+        out_page = out_doc[out_idx]
+        page_label = f"Page {src_idx + 1}"
+        print(f"--- {page_label} (output page {out_idx + 1}) ---")
 
-# 2. Equations preserved
-print("\n[2] Equations:")
-eq_count = 0
-for b in out_blocks:
-    if b["type"] != 0: continue
-    for line in b["lines"]:
-        for span in line["spans"]:
-            if any(mf in span["font"] for mf in MATH_FONTS):
-                eq_count += 1
-print(f"  Math-font spans in output: {eq_count}")
-if eq_count > 0:
-    print("  OK: Equations preserved in original fonts")
-else:
-    print("  PROBLEM: No math fonts found - equations may be lost")
+        issues = compare_pages(src_page, out_page, src_idx + 1)
 
-# 3. Figure/images preserved
-print("\n[3] Images:")
-src_imgs = [b for b in src_blocks if b["type"] == 1]
-out_imgs = [b for b in out_blocks if b["type"] == 1]
-print(f"  Source images: {len(src_imgs)} | Output images: {len(out_imgs)}")
-if len(out_imgs) >= len(src_imgs):
-    print("  OK: Images preserved")
+        if args.save_images:
+            # Render side-by-side
+            dpi = 100
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            src_pix = src_page.get_pixmap(matrix=mat)
+            out_pix = out_page.get_pixmap(matrix=mat)
 
-# 4. Axis labels preserved
-print("\n[4] Figure axis labels (y,S,x,z,v near figure):")
-for b in out_blocks:
-    if b["type"] != 0: continue
-    for line in b["lines"]:
-        for span in line["spans"]:
-            t = span["text"].strip()
-            y = span["bbox"][1]
-            if t and len(t) <= 3 and y > 480 and span["size"] <= 9:
-                has_heb = any("\u0590" <= c <= "\u05FF" for c in t)
-                status = "PROBLEM (Hebrew!)" if has_heb else "OK (original)"
-                print(f"  '{t}' at y={y:.0f} sz={span['size']:.0f} -> {status}")
+            # Create combined image
+            w = src_pix.width + out_pix.width + 4
+            h = max(src_pix.height, out_pix.height)
+            combined = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, w, h), 1)
+            combined.set_rect(fitz.IRect(0, 0, w, h), (255, 255, 255))
+            combined.set_rect(fitz.IRect(src_pix.width, 0, src_pix.width + 4, h), (200, 0, 0))
+            # Copy source on left
+            combined.copy(src_pix, fitz.IRect(0, 0, src_pix.width, src_pix.height))
+            # Copy output on right
+            combined.copy(out_pix, fitz.IRect(src_pix.width + 4, 0,
+                                               src_pix.width + 4 + out_pix.width, out_pix.height))
 
-# 5. Hebrew body text
-print("\n[5] Hebrew body text sample:")
-heb_lines = []
-for b in out_blocks:
-    if b["type"] != 0: continue
-    for line in b["lines"]:
-        for span in line["spans"]:
-            t = span["text"].strip()
-            if t and any("\u0590" <= c <= "\u05FF" for c in t) and span["size"] == 10:
-                heb_lines.append(f"  y={span['bbox'][1]:.0f} '{t[:80]}'")
-for hl in heb_lines[:8]:
-    print(hl)
-print(f"  ... total Hebrew body lines: {len(heb_lines)}")
+            img_path = os.path.splitext(args.output_pdf)[0] + f"_compare_p{src_idx+1}.png"
+            combined.save(img_path)
+            print(f"  Saved comparison: {img_path}")
 
-# 6. Font size consistency
-print("\n[6] Hebrew text font sizes:")
-sizes = {}
-for b in out_blocks:
-    if b["type"] != 0: continue
-    for line in b["lines"]:
-        for span in line["spans"]:
-            t = span["text"].strip()
-            if t and any("\u0590" <= c <= "\u05FF" for c in t):
-                sz = round(span["size"], 1)
-                sizes[sz] = sizes.get(sz, 0) + 1
-for sz in sorted(sizes):
-    print(f"  {sz}pt: {sizes[sz]} spans")
+        if issues:
+            total_issues += len(issues)
+            for issue in issues:
+                print(f"  ISSUE: {issue}")
+        else:
+            print(f"  OK: Layout matches source")
+        print()
 
-# 7. Check for model apology text
-print("\n[7] Model apology check:")
-full_text = out_page.get_text()
-if "מצטער" in full_text:
-    print("  PROBLEM: Found 'מצטער' (sorry) - model refused some translations")
-else:
-    print("  OK: No apology text found")
+    src_doc.close()
+    out_doc.close()
 
-# 8. Overall layout comparison
-print("\n[8] Y-position coverage:")
-src_y_range = [999, 0]
-out_y_range = [999, 0]
-for b in src_blocks:
-    if b["type"] != 0: continue
-    for line in b["lines"]:
-        for span in line["spans"]:
-            if span["text"].strip():
-                src_y_range[0] = min(src_y_range[0], span["bbox"][1])
-                src_y_range[1] = max(src_y_range[1], span["bbox"][3])
-for b in out_blocks:
-    if b["type"] != 0: continue
-    for line in b["lines"]:
-        for span in line["spans"]:
-            if span["text"].strip():
-                out_y_range[0] = min(out_y_range[0], span["bbox"][1])
-                out_y_range[1] = max(out_y_range[1], span["bbox"][3])
-print(f"  Source text y-range: {src_y_range[0]:.0f} - {src_y_range[1]:.0f}")
-print(f"  Output text y-range: {out_y_range[0]:.0f} - {out_y_range[1]:.0f}")
+    # Summary
+    print("=" * 60)
+    if total_issues == 0:
+        print(f"COMPARISON RESULTS: {total_out} pages checked, ALL MATCH SOURCE")
+    else:
+        print(f"COMPARISON RESULTS: {total_out} pages checked, {total_issues} issues found")
+    print("=" * 60)
+    sys.exit(1 if total_issues > 0 else 0)
 
-src.close()
-out.close()
-print("\nDone.")
+
+if __name__ == "__main__":
+    main()

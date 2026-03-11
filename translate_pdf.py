@@ -6,6 +6,7 @@ Handles RTL text, preserves equations and figure labels untouched.
 
 import sys
 import os
+import re
 import json
 import requests
 import fitz  # PyMuPDF
@@ -26,6 +27,70 @@ HEBREW_FONT_BOLD = "C:/Windows/Fonts/davidbd.ttf"
 # Font names that indicate equation/math content — never translate these
 MATH_FONTS = {"PearsonMATH", "MathematicalPi"}
 
+# Map of characters that math fonts encode as "9" (prime) or other misleading glyphs.
+# Applied to extracted text before translation and to translated output before rendering.
+_PRIME_CLEANUP = str.maketrans({
+    "\u2079": "'",   # ⁹ superscript nine → prime
+    "\u2032": "'",   # ′ prime symbol → apostrophe
+    "\u2033": "''",  # ″ double prime → two apostrophes
+    "\u02B9": "'",   # ʹ modifier letter prime
+    "\u02CA": "'",   # ˊ modifier letter acute
+})
+
+
+def _fix_primes(text: str) -> str:
+    """Replace math-font '9' primes and Unicode superscript primes with apostrophe.
+
+    In many physics PDFs, prime marks (S', F', a') are encoded as '9' in math fonts.
+    This function converts patterns like 'S9' → \"S'\" and cleans Unicode superscripts.
+    """
+    # Fix Unicode superscript/prime characters
+    text = text.translate(_PRIME_CLEANUP)
+    # Fix math-font "9" primes: single uppercase/lowercase letter followed by 9
+    # but NOT standalone numbers like "109" or "1-3"
+    text = re.sub(r'(?<=[A-Za-z])9(?=[^0-9]|$)', "'", text)
+    return text
+
+
+# CID font → Unicode character mappings.
+# Math fonts use custom encodings where ASCII codes map to Greek/math glyphs.
+# These mappings convert the garbled extracted text to proper Unicode.
+_MATH_PI_ONE_MAP = str.maketrans({
+    'l': 'λ', 'm': 'μ', 'p': 'π', 'e': 'ε',
+    '2': '²',
+})
+_PEARSON_18_MAP = str.maketrans({'>': '/'})
+_PEARSON_02_MAP = str.maketrans({'*': '×'})
+_PEARSON_20_MAP = str.maketrans({
+    '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄',
+    '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉',
+})
+
+
+def _fix_math_text(text: str, font_name: str) -> str:
+    """Map CID-garbled math font characters to proper Unicode.
+
+    Math fonts like MathematicalPi encode Greek letters as ASCII (l→λ, m→μ).
+    PearsonMATH variants encode operators and subscripts differently.
+    """
+    text = _fix_primes(text)
+    if 'MathematicalPi-One' in font_name:
+        text = text.translate(_MATH_PI_ONE_MAP)
+    elif 'MathematicalPi-Three' in font_name:
+        text = text.replace('\ue0f8', '≈')
+    elif 'PearsonMATH18' in font_name:
+        text = text.translate(_PEARSON_18_MAP)
+    elif 'PearsonMATH02' in font_name:
+        text = text.translate(_PEARSON_02_MAP)
+    elif 'PearsonMATH20' in font_name:
+        text = text.translate(_PEARSON_20_MAP)
+    # PearsonMATH08/12: = stays as = (correct)
+    # Remove garbled private-use / replacement characters
+    text = text.replace('\ufffd', '')
+    text = text.replace('\u0e00', 'ε')
+    text = text.replace('\ue0ab', '')
+    return text
+
 
 def translate_text(text: str) -> str:
     """Translate English text to Hebrew using Ollama translategemma:12b."""
@@ -36,6 +101,9 @@ def translate_text(text: str) -> str:
     if not any(c.isalpha() for c in text):
         return text
 
+    # Clean up math-font prime encoding (S9 → S') before translation
+    text = _fix_primes(text)
+
     try:
         resp = requests.post(
             OLLAMA_URL,
@@ -45,10 +113,19 @@ def translate_text(text: str) -> str:
                     {
                         "role": "system",
                         "content": (
-                            "You are a professional English-to-Hebrew translator. "
+                            "You are a professional English-to-Hebrew translator for physics textbooks. "
                             "Translate the given English text to Hebrew. "
                             "Output ONLY the Hebrew translation, nothing else. "
-                            "Do not explain, do not add notes, do not repeat the original."
+                            "Do not explain, do not add notes, do not repeat the original. "
+                            "CRITICAL RULES:\n"
+                            "1. Keep ALL mathematical expressions EXACTLY as they appear. "
+                            "This includes: equations (F=ma, E=mc², v²/c²), variable names "
+                            "(c, v, q, S, S', F', λ, μ₀, ε₀, π), numbers with units "
+                            "(3.00 × 10⁸ m/s, 30 km/s), and formulas (kqλ/y₁, -μ₀λv²q/(2πy₁)).\n"
+                            "2. Do NOT translate or modify any part of an equation.\n"
+                            "3. Equations should appear in their original form embedded in the Hebrew text.\n"
+                            "4. Figure references like 'Figure 1-4' should become 'איור 1-4'.\n"
+                            "5. Equation references like 'Equation 1-3' should become 'משוואה 1-3'."
                         ),
                     },
                     {"role": "user", "content": text},
@@ -66,6 +143,8 @@ def translate_text(text: str) -> str:
             return text
         # Strip any leading/trailing quotes or markers the model may add
         result = result.strip('"\'`')
+        # Clean up any superscript/prime characters the model may output
+        result = _fix_primes(result)
         return result if result else text
     except Exception as e:
         print(f"  [Translation error: {e}] Keeping original text.")
@@ -127,179 +206,266 @@ def _tprint(*args, **kwargs):
         print(*args, **kwargs)
 
 
-def translate_page(page: fitz.Page, page_num: int):
-    """Translate text on a page from English to Hebrew, preserving equations and layout."""
+def translate_page(page: fitz.Page, page_num: int, source_page: fitz.Page = None):
+    """Translate text on a page from English to Hebrew, preserving equations and layout.
+
+    Paragraph-level approach:
+    - Equation blocks (math fonts, <15 alpha) → skip entirely
+    - Short labels (≤3 chars) → skip entirely
+    - Body text blocks → merge lines into paragraph, translate, render Hebrew
+    - Mixed blocks (math fonts + ≥15 alpha) → translate text portions
+    - Figures (vector drawing clusters) → capture as images from source
+    """
     _tprint(f"Processing page {page_num}...")
 
     text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
     blocks = text_dict.get("blocks", [])
 
-    # Phase 1: Classify blocks, collect translatable units.
-    # Each "unit" = one entire block merged into a single paragraph.
-    # This prevents Hebrew text from overflowing into adjacent equation blocks.
+    # Detect figure regions (clusters of vector drawings) — capture as images
+    figure_rects = []
+    capture_page = source_page if source_page is not None else page
+    capture_scale = 288.0 / 72.0  # 4x for crisp capture
+
+    try:
+        drawings = capture_page.get_drawings()
+    except Exception:
+        drawings = []
+
+    figure_images = []  # (rect, png_bytes) for figure regions
+
+    if drawings:
+        page_w, page_h = page.rect.width, page.rect.height
+        filtered = [d for d in drawings
+                    if not (fitz.Rect(d["rect"]).width > page_w * 0.6 or
+                            fitz.Rect(d["rect"]).height > page_h * 0.6 or
+                            fitz.Rect(d["rect"]).width > 150 or
+                            fitz.Rect(d["rect"]).height > 100 or
+                            (fitz.Rect(d["rect"]).width < 0.5 and fitz.Rect(d["rect"]).height < 0.5))]
+
+        used = [False] * len(filtered)
+        clusters = []
+        for i, d in enumerate(filtered):
+            if used[i]:
+                continue
+            cluster = [d]; used[i] = True; stack = [i]
+            while stack:
+                ci = stack.pop()
+                cr = fitz.Rect(filtered[ci]["rect"])
+                for j, d2 in enumerate(filtered):
+                    if used[j]:
+                        continue
+                    r2 = fitz.Rect(d2["rect"])
+                    if (cr.x0 - 20 <= r2.x1 and r2.x0 <= cr.x1 + 20 and
+                            cr.y0 - 20 <= r2.y1 and r2.y0 <= cr.y1 + 20):
+                        cluster.append(d2); used[j] = True; stack.append(j)
+            clusters.append(cluster)
+
+        for cluster in clusters:
+            if len(cluster) < 5:
+                continue
+            cx0 = min(d["rect"][0] for d in cluster)
+            cy0 = min(d["rect"][1] for d in cluster)
+            cx1 = max(d["rect"][2] for d in cluster)
+            cy1 = max(d["rect"][3] for d in cluster)
+            fig_rect = fitz.Rect(cx0, cy0, cx1, cy1)
+            if fig_rect.width < 50 or fig_rect.height < 50:
+                continue
+            expanded = fitz.Rect(fig_rect)
+            for block in blocks:
+                if block["type"] != 0:
+                    continue
+                br = fitz.Rect(block["bbox"])
+                padded = fitz.Rect(fig_rect.x0-10, fig_rect.y0-10, fig_rect.x1+10, fig_rect.y1+10)
+                if br.intersects(padded) and len(_block_full_text(block)) < 30:
+                    expanded |= br
+            expanded = fitz.Rect(expanded.x0-5, expanded.y0-5, expanded.x1+5, expanded.y1+5)
+            if any(expanded.intersects(fr) for fr in figure_rects):
+                continue
+            mat = fitz.Matrix(capture_scale, capture_scale)
+            pix = capture_page.get_pixmap(matrix=mat, clip=expanded, alpha=False)
+            figure_images.append((expanded, pix.tobytes("png")))
+            figure_rects.append(expanded)
+
+    # Phase 1: Classify blocks and collect translatable units
     units = []
 
     for block in blocks:
         if block["type"] != 0:
             continue
-
+        block_rect = fitz.Rect(block["bbox"])
+        # Skip blocks inside figure regions
+        if any(block_rect.intersects(fr) for fr in figure_rects):
+            continue
         full_text = _block_full_text(block)
-
-        # Skip: empty or no alpha
         if not full_text or not any(c.isalpha() for c in full_text):
             continue
-
-        # Skip: short labels (axis labels like y, S, x, z, v, S')
+        # Skip short labels (axis labels like y, x, S, v)
         if len(full_text.replace(" ", "")) <= 3:
             continue
-
-        # Skip: equation blocks (math fonts) — both pure equations and mixed
-        # text+equation blocks. Inline math is interleaved with text on the
-        # same lines, so placing Hebrew over them causes visual overlap.
-        if _block_has_math_font(block):
+        # Skip pure equation blocks (math fonts + few alpha chars)
+        if _block_has_math_font(block) and _block_alpha_count(block) < 15:
             continue
-        line_entries = []
+
+        # This block should be translated — merge lines into paragraph
+        lines = block["lines"]
+        line_texts = []
         all_spans = []
-        for line in block["lines"]:
-            lt = ""
-            spans = []
-            for span in line["spans"]:
-                if not span["text"].strip():
-                    continue
-                lt += span["text"]
-                spans.append(span)
-            lt_stripped = lt.strip()
-            if lt_stripped:
-                y_vals = [s["bbox"][1] for s in spans]
-                y_top = min(y_vals) if y_vals else 0
-                y_bottom = max(s["bbox"][3] for s in spans) if spans else 0
-                line_entries.append({
-                    "text": lt_stripped,
-                    "y_top": y_top,
-                    "y_bottom": y_bottom,
-                })
-                all_spans.extend(spans)
 
-        if not line_entries:
+        for line in lines:
+            parts = []
+            for span in line["spans"]:
+                t = span["text"]
+                if t.strip():
+                    # ALL spans get added to redact list (including math-font)
+                    # to prevent black residue from un-redacted math characters
+                    all_spans.append(span)
+
+                    # Math-font spans → fix CID encoding to proper Unicode
+                    # (l→λ, m→μ, >→/, etc.) then include in paragraph
+                    if any(mf in span["font"] for mf in MATH_FONTS):
+                        fixed = _fix_math_text(t.strip(), span["font"])
+                        if fixed:
+                            parts.append(fixed)
+                        else:
+                            if not parts or parts[-1] != " ":
+                                parts.append(" ")
+                        continue
+                    parts.append(t)
+            line_text = "".join(parts).strip()
+            if line_text:
+                line_texts.append(line_text)
+
+        if not line_texts:
             continue
 
-        # Merge ALL lines in the block into one paragraph (handling hyphenation)
+        # Merge lines into paragraph with hyphenation handling
         paragraph = ""
-        for entry in line_entries:
-            lt = entry["text"]
+        for lt in line_texts:
             if paragraph.endswith("-"):
-                paragraph = paragraph[:-1] + lt  # remove hyphen, join
+                # Check if this is a hyphenated word break (not a compound like "al-Haytham")
+                paragraph = paragraph[:-1] + lt
             elif paragraph:
                 paragraph += " " + lt
             else:
                 paragraph = lt
 
-        if not paragraph.strip() or not any(c.isalpha() for c in paragraph):
-            continue
-
-        # Block margins and line positions
-        block_x0 = min(s["bbox"][0] for s in all_spans)
-        block_x1 = max(s["bbox"][2] for s in all_spans)
-        first_span = all_spans[0]
+        # Get block metrics from first non-math span
+        first_span = all_spans[0] if all_spans else lines[0]["spans"][0]
 
         units.append({
-            "text": paragraph.strip(),
-            "spans": all_spans,
-            "y_tops": [e["y_top"] for e in line_entries],
-            "y_bottoms": [e["y_bottom"] for e in line_entries],
+            "paragraph": paragraph.strip(),
+            "spans": all_spans,  # spans to redact
+            "lines": lines,
             "font_size": first_span["size"],
             "color": first_span.get("color", 0),
             "is_bold": bool(first_span.get("flags", 0) & (2**4)),
-            "block_x0": block_x0,
-            "block_x1": block_x1,
+            "block_x0": block["bbox"][0],
+            "block_x1": block["bbox"][2],
+            "block_y0": block["bbox"][1],
+            "block_y1": block["bbox"][3],
         })
 
     if not units:
         _tprint(f"  No translatable text on page {page_num}.")
+        for rect, png_bytes in figure_images:
+            page.draw_rect(rect, color=None, fill=(1, 1, 1))
+            page.insert_image(rect, stream=png_bytes, keep_proportion=True)
         return
 
-    # Phase 2: Translate all units
+    # Phase 2: Translate all paragraphs
     translations = {}
     for i, unit in enumerate(units):
-        ut = unit["text"]
-        if ut not in translations:
+        para = unit["paragraph"]
+        if para and para not in translations:
             _tprint(f"  [p{page_num}] Translating ({i+1}/{len(units)}): "
-                  f"{ut[:60]}{'...' if len(ut)>60 else ''}")
-            translations[ut] = translate_text(ut)
+                  f"{para[:60]}{'...' if len(para)>60 else ''}")
+            translations[para] = translate_text(para)
 
-    # Phase 3: Redact original text for all units
+    # Phase 3: Redact original text spans (white fill)
     for unit in units:
         for span in unit["spans"]:
             rect = fitz.Rect(span["bbox"])
             page.add_redact_annot(rect, text="", fill=(1, 1, 1))
     page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-    # Phase 4: Insert translated Hebrew text
+    # Phase 4: Render Hebrew translations
     MIN_FONT_SIZE = 6.0
 
     for unit in units:
-        translated = translations.get(unit["text"], unit["text"])
+        translated = translations.get(unit["paragraph"], unit["paragraph"])
+        if not translated or not any("\u0590" <= ch <= "\u05FF" for ch in translated):
+            continue
+
         font_size = unit["font_size"]
         is_bold = unit["is_bold"]
-        block_x1 = unit["block_x1"]
         block_x0 = unit["block_x0"]
+        block_x1 = unit["block_x1"]
         block_width = block_x1 - block_x0
-        y_tops = unit["y_tops"]
-        y_bottoms = unit["y_bottoms"]
-        n_available = len(y_tops)  # number of original line slots
 
-        # Convert integer color to RGB tuple
-        c = unit["color"]
-        r_c = ((c >> 16) & 0xFF) / 255.0
-        g_c = ((c >> 8) & 0xFF) / 255.0
-        b_c = (c & 0xFF) / 255.0
+        c_int = unit["color"]
+        r_c = ((c_int >> 16) & 0xFF) / 255.0
+        g_c = ((c_int >> 8) & 0xFF) / 255.0
+        b_c = (c_int & 0xFF) / 255.0
 
         font_path = HEBREW_FONT_BOLD if is_bold else HEBREW_FONT
         if not os.path.exists(font_path):
             font_path = HEBREW_FONT
-        font = fitz.Font(fontfile=font_path)
+        heb_font = fitz.Font(fontfile=font_path)
 
-        # Word-wrap translation to fit in block width.
-        # If wrapped lines exceed available slots, scale font down to fit.
+        # Get line y-positions from original block
+        lines = unit["lines"]
+        y_tops = [line["bbox"][1] for line in lines]
+        y_bottoms = [line["bbox"][3] for line in lines]
+
+        # De-duplicate overlapping y-positions
+        deduped_idx = [0]
+        for k in range(1, len(y_tops)):
+            if abs(y_tops[k] - y_tops[deduped_idx[-1]]) > 5:
+                deduped_idx.append(k)
+        y_tops = [y_tops[k] for k in deduped_idx]
+        y_bottoms = [y_bottoms[k] for k in deduped_idx]
+        n_available = len(y_tops)
+
+        # Word-wrap and fit
         actual_size = font_size
-        wrapped = wrap_hebrew_text(translated, font, actual_size, block_width)
-
+        wrapped = wrap_hebrew_text(translated, heb_font, actual_size, block_width)
         while len(wrapped) > n_available and actual_size > MIN_FONT_SIZE:
             actual_size *= 0.92
-            wrapped = wrap_hebrew_text(translated, font, actual_size, block_width)
-
-        # Hard cap: never exceed available line slots (prevents overlap)
+            wrapped = wrap_hebrew_text(translated, heb_font, actual_size, block_width)
         wrapped = wrapped[:n_available]
 
-        # Compute line spacing from original positions
-        if len(y_tops) >= 2:
-            line_spacing = (y_tops[-1] - y_tops[0]) / (len(y_tops) - 1)
+        if n_available >= 2:
+            line_spacing = (y_tops[-1] - y_tops[0]) / (n_available - 1)
         else:
             line_spacing = actual_size * 1.2
 
-        # Place each wrapped line at its original y position
         for j, wline in enumerate(wrapped):
-            visual = get_display(wline)
-            tl = font.text_length(visual, fontsize=actual_size)
-
-            # Right-align to this block's right edge
-            x_pos = block_x1 - tl
-            if x_pos < 0:
-                x_pos = 0
-
-            # Use original line position
+            wline_clean = ''.join(ch for ch in wline if ch.isprintable() or ch == ' ')
+            try:
+                visual = get_display(wline_clean)
+            except Exception:
+                visual = wline_clean
+            tl = heb_font.text_length(visual, fontsize=actual_size)
+            x_pos = max(0, block_x1 - tl)
             if j < len(y_tops):
                 y_pos = y_bottoms[j] - (y_bottoms[j] - y_tops[j]) * 0.15
             else:
                 y_pos = y_bottoms[-1] + (j - len(y_tops) + 1) * line_spacing
-
             tw = fitz.TextWriter(page.rect)
             try:
                 tw.append(fitz.Point(x_pos, y_pos), visual,
-                          font=font, fontsize=actual_size)
+                          font=heb_font, fontsize=actual_size)
                 tw.write_text(page, color=(r_c, g_c, b_c))
             except Exception as e:
                 _tprint(f"  [p{page_num} Insert error: {e}]")
+
+    # Phase 5: Paste figure region images
+    for rect, png_bytes in figure_images:
+        try:
+            page.draw_rect(rect, color=None, fill=(1, 1, 1))
+            page.insert_image(rect, stream=png_bytes, keep_proportion=True)
+        except Exception as e:
+            _tprint(f"  [p{page_num} Figure paste error: {e}]")
 
 
 def _translate_page_worker(src_pdf_path: str, orig_page_idx: int) -> bytes:
@@ -311,9 +477,11 @@ def _translate_page_worker(src_pdf_path: str, orig_page_idx: int) -> bytes:
     doc = fitz.open(src_pdf_path)
     tmp_doc = fitz.open()
     tmp_doc.insert_pdf(doc, from_page=orig_page_idx, to_page=orig_page_idx)
-    doc.close()
+    # Keep source page open for equation/image capture
+    source_page = doc[orig_page_idx]
 
-    translate_page(tmp_doc[0], page_num)
+    translate_page(tmp_doc[0], page_num, source_page=source_page)
+    doc.close()
 
     pdf_bytes = tmp_doc.tobytes(garbage=4, deflate=True)
     tmp_doc.close()
@@ -428,34 +596,60 @@ def main():
         out_doc = fitz.open()
         for orig_page in pages:
             out_doc.insert_pdf(doc, from_page=orig_page, to_page=orig_page)
-        doc.close()
 
         for i in range(len(out_doc)):
-            orig_page_num = pages[i] + 1
-            translate_page(out_doc[i], orig_page_num)
+            orig_page_idx = pages[i]
+            orig_page_num = orig_page_idx + 1
+            # Pass source page for equation/image capture
+            translate_page(out_doc[i], orig_page_num, source_page=doc[orig_page_idx])
+        doc.close()
 
-    # Save output
+    # Save output first, then clean up old files
+    import glob
     base, ext = os.path.splitext(os.path.basename(pdf_path))
-    output_path = os.path.join(
-        os.path.dirname(pdf_path),
-        f"{base}_hebrew_p{page_range_str.replace(',','_').replace(' ','')}.pdf",
-    )
+    out_dir = os.path.dirname(pdf_path)
+    range_tag = page_range_str.replace(',', '_').replace(' ', '')
+    output_path = os.path.join(out_dir, f"{base}_hebrew_p{range_tag}.pdf")
 
+    # Save to a temporary name first to avoid deleting old before new is ready
+    tmp_path = output_path + ".tmp"
     try:
-        out_doc.save(output_path, garbage=4, deflate=True)
+        out_doc.save(tmp_path, garbage=4, deflate=True)
     except Exception:
-        base_out, ext_out = os.path.splitext(output_path)
-        # Try _new, then timestamp fallback
-        for suffix in ["_new", f"_{int(__import__('time').time())}"]:
-            try:
-                output_path = f"{base_out}{suffix}{ext_out}"
-                out_doc.save(output_path, garbage=4, deflate=True)
-                break
-            except Exception:
-                continue
+        tmp_path = os.path.join(out_dir, f"{base}_hebrew_p{range_tag}_{int(__import__('time').time())}.pdf.tmp")
+        out_doc.save(tmp_path, garbage=4, deflate=True)
     out_doc.close()
 
-    print(f"\nDone! Translated PDF saved to: {output_path}")
+    # Now clean up old generated files (previous translation PDFs and rendered PNGs)
+    for pattern in [f"{base}_hebrew_*.pdf", f"{base}_hebrew_*.png"]:
+        for old_file in glob.glob(os.path.join(out_dir, pattern)):
+            if old_file == tmp_path:
+                continue  # don't delete the file we just saved
+            try:
+                os.remove(old_file)
+            except OSError:
+                pass  # file may be open
+
+    # Rename temp to final
+    final_path = output_path
+    try:
+        if os.path.exists(final_path):
+            os.remove(final_path)
+        os.rename(tmp_path, final_path)
+    except OSError:
+        # Original locked — save as _new.pdf
+        final_path = output_path.replace(".pdf", "_new.pdf")
+        try:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+        except OSError:
+            pass
+        try:
+            os.rename(tmp_path, final_path)
+        except OSError:
+            final_path = tmp_path  # keep as .tmp if all else fails
+
+    print(f"\nDone! Translated PDF saved to: {final_path}")
 
 
 if __name__ == "__main__":

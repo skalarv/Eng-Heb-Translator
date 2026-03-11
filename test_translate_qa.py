@@ -137,8 +137,8 @@ mixed_block = {"type": 0, "lines": [
     ]}
 ]}
 test("Mixed block: has math font", _block_has_math_font(mixed_block))
-test("Mixed block: skipped (has math font → no translation)",
-     _block_has_math_font(mixed_block))
+test("Mixed block: many alpha in text fonts (keep for translation)",
+     _block_alpha_count(mixed_block) >= 15)
 
 
 # ── Test Group 5: Hyphenation Merging ──
